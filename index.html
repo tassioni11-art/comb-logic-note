@@ -103,6 +103,11 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .status.good { color: var(--ok); }
 #fallback textarea { min-height: 200px; font-family: var(--font-mono); font-size: 12px; }
 .small { font-size: 13px; color: var(--muted); margin: 0; }
+.notice { margin: -12px 0 0; font-size: 13px; color: var(--muted); }
+button.quiet { border-color: var(--line); color: var(--muted); }
+.confirm { border: 1.5px dashed var(--muted); border-radius: 10px; padding: 12px 14px; background: var(--surface); display: flex; flex-direction: column; gap: 10px; }
+.confirm p { margin: 0; font-size: 14px; }
+.confirm[hidden] { display: none; }
 @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
 </style>
 </head>
@@ -123,6 +128,8 @@ button:disabled { opacity: .45; cursor: not-allowed; }
   </div>
 
   <div class="rule">AI 답을 통째로 붙여 넣으면 수행평가 시간에 쓸 수 있는 내 말이 남지 않습니다. 두세 문장으로 줄이고, 사례는 장치 이름이 분명한 것을 고르세요. 쓴 내용은 이 기기의 브라우저에만 임시 저장되니 꼭 내려받으세요.</div>
+  <p class="notice">작성 과정(작성 시간, 직접 입력 비율)이 정리본에 함께 기록됩니다. 기록은 이 기기의 브라우저 안에만 남고 어디로도 보내지지 않습니다.</p>
+
 
   <div class="student">
     <div><label for="s-id">학번</label><input id="s-id" inputmode="numeric" placeholder="예: 20315"></div>
@@ -138,10 +145,16 @@ button:disabled { opacity: .45; cursor: not-allowed; }
     <div class="eyebrow">STEP 3</div>
     <h2>내 조사자료 내려받기</h2>
     <p class="small" id="summary"></p>
+    <p class="small" id="log-summary"></p>
     <div class="row">
       <button class="primary" id="dl-html" type="button">정리본 내려받기 (.html)</button>
       <button class="primary" id="dl-docx" type="button">워드 문서로 내려받기 (.docx)</button>
       <button id="show-copy" type="button">내용 복사하기</button>
+      <button id="reset-all" class="quiet" type="button">처음부터 새로 쓰기</button>
+    </div>
+    <div class="confirm" id="reset-confirm" hidden>
+      <p>지금 쓴 내용과 작성 과정 기록이 이 브라우저에서 모두 지워집니다. 아직 내려받지 않았다면 먼저 내려받으세요.</p>
+      <div class="row"><button class="primary" id="reset-yes" type="button">지우고 새로 시작</button><button id="reset-no" type="button">취소</button></div>
     </div>
     <p class="status" id="dl-status" role="status"></p>
     <p class="small">정리본(.html)은 휴대폰이나 컴퓨터 브라우저에서 바로 열리고, 워드 문서(.docx)는 워드나 한글에서 열어 고치거나 인쇄할 수 있습니다.</p>
@@ -216,6 +229,170 @@ const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '
 const allFields = q => q.fields.map(f => q.id + '.' + f.k).concat(q.src ? [q.id + '.src', q.id + '.query'] : []);
 const answered = q => q.fields.every(f => (state[q.id + '.' + f.k] || '').trim());
 
+// ── 작성 과정 기록: 모두 이 브라우저 안에서만 집계하고 저장한다 (외부 전송 없음) ──
+const LOG_KEY = 'comb-research-log-v1';
+const AUTO_MIN = 5;        // 키 입력 없이 이만큼 이상 한꺼번에 늘면 자동 입력으로 본다
+const KEY_WINDOW = 1500;   // 마지막 키 입력 뒤 이 시간 안의 변화는 직접 입력으로 본다
+const IDLE_CAP = 120000;   // 입력 사이에 2분 넘게 쉰 시간은 활동 시간에서 뺀다
+const LOG_NOTE = '글자 수는 칸에 들어온 글자를 방법별로 센 값입니다. 직접 입력은 키보드로 친 글자, 붙여넣기는 복사해 붙이거나 끌어다 놓은 글자, 자동 입력은 키를 누르지 않았는데 한꺼번에 들어온 글자(확장 프로그램, 자동 완성, 음성 입력 등)입니다. 지운 글자는 빼지 않습니다. 이 기록은 학생 브라우저 안에서만 집계되었습니다.';
+const LABELS = {};
+SECTIONS.forEach(s => s.qs.forEach(q => {
+  q.fields.forEach(f => { LABELS[q.id + '.' + f.k] = q.id + ' ' + f.l; });
+  if (q.src) { LABELS[q.id + '.src'] = q.id + ' 출처'; LABELS[q.id + '.query'] = q.id + ' 검색어'; }
+}));
+let log = null;
+try { log = JSON.parse(localStorage.getItem(LOG_KEY) || 'null'); } catch (e) { log = null; }
+const prevVal = {};
+let lastKey = { k: null, at: 0 }, composing = false, pasteHint = null, logTimer = null;
+let resetting = false;
+const saveLog = () => { clearTimeout(logTimer); if (resetting) return; try { localStorage.setItem(LOG_KEY, JSON.stringify(log)); } catch (e) {} };
+const saveLogSoon = () => { clearTimeout(logTimer); logTimer = setTimeout(saveLog, 400); };
+const fieldLog = k => log.fields[k] || (log.fields[k] = { typed: 0, pasted: 0, auto: 0, pre: 0, first: null, last: null });
+const isField = el => !!(el && el.dataset && el.dataset.k);
+
+function markActivity(now) {
+  if (!log.startedAt) log.startedAt = now;
+  if (log.lastInputAt) log.activeMs += Math.min(now - log.lastInputAt, IDLE_CAP);
+  log.lastInputAt = now;
+}
+
+// 이벤트 없이 값이 바뀐 칸(확장 프로그램이 value만 바꾼 경우)을 찾아 자동 입력으로 세고 저장한다
+function syncSilent(el) {
+  const k = el.dataset.k, before = prevVal[k] ?? '';
+  if (el.value === before) return;
+  const now = Date.now(), grow = Math.max(0, el.value.length - before.length), f = fieldLog(k);
+  prevVal[k] = el.value;
+  if (grow) { f.auto += grow; if (!f.first) f.first = now; }
+  f.last = now;
+  markActivity(now);
+  state[k] = el.value; save();
+  saveLogSoon();
+}
+
+function onLogInput(e) {
+  const el = e.target;
+  if (!isField(el)) return;
+  const k = el.dataset.k, now = Date.now(), before = prevVal[k] ?? '', after = el.value;
+  prevVal[k] = after;
+  if (after === before) return;
+  const t = e.inputType || '', grow = Math.max(0, after.length - before.length), f = fieldLog(k);
+  const hint = pasteHint && pasteHint.k === k && now - pasteHint.at < 300 ? pasteHint : null;
+  let kind = null, n = grow;
+  if (!e.isTrusted) kind = 'auto';
+  else if (t === 'insertFromPaste' || t === 'insertFromDrop' || hint) { kind = 'pasted'; if (hint && hint.n) n = hint.n; pasteHint = null; }
+  else if (t.startsWith('history') || t.startsWith('delete')) kind = null;
+  else if (composing || t === 'insertCompositionText' || (lastKey.k === k && now - lastKey.at < KEY_WINDOW)) kind = 'typed';
+  else kind = grow >= AUTO_MIN ? 'auto' : 'typed';
+  if (kind && n > 0) { f[kind] += n; if (!f.first) f.first = now; }
+  f.last = now;
+  markActivity(now);
+  saveLogSoon();
+}
+
+function initLog() {
+  const now = Date.now();
+  const fresh = !log || typeof log !== 'object';
+  if (fresh) log = { openedAt: now, startedAt: null, lastInputAt: null, activeMs: 0, tabAway: 0, opens: 0, fields: {}, downloads: [] };
+  log.fields = log.fields || {}; log.downloads = log.downloads || [];
+  log.opens = (log.opens || 0) + 1;
+  document.querySelectorAll('[data-k]').forEach(el => {
+    prevVal[el.dataset.k] = el.value;
+    // 이 기능이 생기기 전에 써 둔 글자는 '기록 전'으로 따로 둔다
+    if (fresh && el.value) fieldLog(el.dataset.k).pre = el.value.length;
+  });
+  saveLog();
+  document.addEventListener('keydown', e => { if (isField(e.target)) { syncSilent(e.target); lastKey = { k: e.target.dataset.k, at: Date.now() }; } }, true);
+  document.addEventListener('compositionstart', () => { composing = true; }, true);
+  document.addEventListener('compositionend', e => { composing = false; if (isField(e.target)) lastKey = { k: e.target.dataset.k, at: Date.now() }; }, true);
+  document.addEventListener('paste', e => {
+    if (!isField(e.target)) return;
+    let n = 0;
+    try { n = (e.clipboardData.getData('text') || '').length; } catch (err) {}
+    pasteHint = { k: e.target.dataset.k, n, at: Date.now() };
+  }, true);
+  document.addEventListener('input', onLogInput, true);
+  document.addEventListener('focusout', e => { if (isField(e.target)) syncSilent(e.target); }, true);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden' && !resetting) { log.tabAway++; saveLog(); }
+    updateLogSummary();
+  });
+  window.addEventListener('pagehide', saveLog);
+  updateLogSummary();
+}
+
+function recordDownload(ext) {
+  document.querySelectorAll('[data-k]').forEach(syncSilent);
+  const now = Date.now();
+  log.downloads.push({ at: now, ext });
+  if (log.downloads.length > 50) log.downloads.shift();
+  saveLog();
+  return now;
+}
+
+const pct = (a, sum) => sum ? Math.round(a / sum * 100) + '%' : '-';
+const fmtAt = ms => {
+  if (!ms) return '-';
+  const d = new Date(ms), p = n => String(n).padStart(2, '0');
+  return `${d.getMonth() + 1}/${d.getDate()} ${p(d.getHours())}:${p(d.getMinutes())}`;
+};
+const fmtDur = ms => {
+  if (!ms) return '-';
+  if (ms < 60000) return '1분 미만';
+  const m = Math.round(ms / 60000);
+  return m >= 60 ? `${Math.floor(m / 60)}시간 ${m % 60}분` : `${m}분`;
+};
+
+function logStats(endAt) {
+  const rows = [];
+  let T = 0, P = 0, A = 0, R = 0;
+  Object.keys(LABELS).forEach(k => {
+    const f = log && log.fields[k];
+    if (!f || !(f.typed || f.pasted || f.auto || f.pre)) return;
+    T += f.typed; P += f.pasted; A += f.auto; R += f.pre;
+    rows.push(Object.assign({ label: LABELS[k] }, f));
+  });
+  return { rows, T, P, A, R, hasPre: R > 0, start: log && log.startedAt, end: endAt,
+    total: log && log.startedAt ? Math.max(0, endAt - log.startedAt) : 0,
+    active: log ? log.activeMs : 0, tabAway: log ? log.tabAway : 0, opens: log ? log.opens : 0 };
+}
+
+function logLines(st) {
+  const sum = st.T + st.P + st.A;
+  return [
+    `첫 입력 ${fmtAt(st.start)}, 내려받기 ${fmtAt(st.end)}, 전체 작성 시간 ${fmtDur(st.total)}, 입력 활동 시간 ${fmtDur(st.active)} (입력 사이 2분 넘게 쉰 시간 제외)`,
+    `글자 수 합계: 직접 입력 ${st.T}자 (${pct(st.T, sum)}), 붙여넣기 ${st.P}자 (${pct(st.P, sum)}), 자동 입력 ${st.A}자 (${pct(st.A, sum)})` + (st.hasPre ? `, 기록 시작 전에 써 둔 글자 ${st.R}자` : ''),
+    `다른 탭이나 창으로 나갔다 온 횟수 ${st.tabAway}회, 페이지를 연 횟수 ${st.opens}회`,
+  ];
+}
+
+const logCols = st => ['칸', '직접 입력', '붙여넣기', '자동 입력'].concat(st.hasPre ? ['기록 전'] : [], ['직접 입력 비율', '처음 입력', '마지막 수정']);
+const logRow = (st, r) => [r.label, r.typed, r.pasted, r.auto].concat(st.hasPre ? [r.pre] : [],
+  [pct(r.typed, r.typed + r.pasted + r.auto), fmtAt(r.first), fmtAt(r.last)]);
+
+function logHtml(st) {
+  const cols = logCols(st);
+  const body = st.rows.length ? st.rows.map(r => '<tr>' + logRow(st, r).map(v => `<td>${esc(v)}</td>`).join('') + '</tr>').join('')
+    : `<tr><td colspan="${cols.length}">기록된 입력이 없습니다.</td></tr>`;
+  return `<section class="log"><h4>작성 과정 기록</h4>${logLines(st).map(l => `<p>${esc(l)}</p>`).join('')}` +
+    `<table><tr>${cols.map(c => `<th>${esc(c)}</th>`).join('')}</tr>${body}</table><p>${esc(LOG_NOTE)}</p></section>`;
+}
+
+function logText(st) {
+  const L = ['', '■ 작성 과정 기록'].concat(logLines(st).map(l => '  ' + l));
+  st.rows.forEach(r => L.push(`  - ${r.label}: 직접 ${r.typed}, 붙여넣기 ${r.pasted}, 자동 ${r.auto}` + (st.hasPre ? `, 기록 전 ${r.pre}` : '') + `, 처음 ${fmtAt(r.first)}, 마지막 ${fmtAt(r.last)}`));
+  return L.join('\n');
+}
+
+function updateLogSummary() {
+  const el = document.getElementById('log-summary');
+  if (!el || !log) return;
+  const st = logStats(Date.now()), sum = st.T + st.P + st.A;
+  el.textContent = sum
+    ? `지금까지의 작성 과정 기록: 직접 입력 ${pct(st.T, sum)}, 붙여넣기 ${pct(st.P, sum)}, 자동 입력 ${pct(st.A, sum)}, 다른 탭으로 나간 횟수 ${st.tabAway}회. 이 내용은 정리본 맨 아래에 함께 들어갑니다.`
+    : '작성 과정 기록은 첫 입력부터 시작되며 정리본 맨 아래에 함께 들어갑니다.';
+}
+
+
 function render() {
   const main = document.getElementById('sections');
   main.innerHTML = SECTIONS.map(s => `
@@ -263,6 +440,7 @@ function progress() {
   document.getElementById('summary').textContent =
     `${who || '학번과 이름을 아직 쓰지 않았어요.'} 질문 ${total}개 중 ${done}개를 다 채웠습니다.` +
     (done < total ? ' 빈 칸이 있어도 내려받을 수 있지만, 수행평가 때 볼 자료가 부족할 수 있어요.' : '');
+  updateLogSummary();
 }
 
 function fileBase() {
@@ -288,10 +466,10 @@ function toText() {
       L.push('');
     });
   });
-  return L.join('\n');
+  return L.join('\n') + logText(logStats(Date.now()));
 }
 
-function toHtml() {
+function toHtml(endAt = Date.now()) {
   const v = k => { const t = (state[k] || '').trim(); return t ? esc(t).replace(/\n/g, '<br>') : '<span class="empty">비어 있음</span>'; };
   const body = SECTIONS.map(s => `
     <h2>${s.pin}. ${esc(s.title)}</h2>
@@ -308,12 +486,12 @@ h2{font-size:17px;border-bottom:2px solid #3a4cf5;padding-bottom:4px;margin:26px
 .q{break-inside:avoid;margin-bottom:14px}h3{font-size:15px;margin:0 0 2px}.ask{margin:0 0 6px;color:#5a5f86;font-size:13px}
 table{width:100%;border-collapse:collapse}th,td{border:1px solid #d0d5f2;padding:6px 8px;vertical-align:top;text-align:left}
 th{width:32%;background:#eef0ff;font-weight:600;font-size:13px}tr.m th,tr.m td{font-size:12px;color:#5a5f86}.empty{color:#b0b8b4}
-</style></head><body><h1>조합논리회로 조사노트</h1>
+.log{margin-top:40px;padding-top:10px;border-top:1px solid #e4e6ec;color:#8a8f99;font-size:11px;line-height:1.5}.log h4{font-size:12px;margin:0 0 4px;font-weight:600}.log p{margin:0 0 2px}.log table{margin:6px 0}.log th,.log td{border:1px solid #e4e6ec;padding:3px 5px;color:#8a8f99;background:none;font-weight:400;font-size:11px;width:auto}.log th{font-weight:600}</style></head><body><h1>조합논리회로 조사노트</h1>
 <p class="who">학번 ${esc(state['s-id'] || '')} · 이름 ${esc(state['s-name'] || '')} · 조사한 날 ${esc(state['s-date'] || '')}</p>
-${body}</body></html>`;
+${body}${logHtml(logStats(endAt))}</body></html>`;
 }
 
-function toDocx() {
+function toDocx(endAt = Date.now()) {
   const x = t => String(t ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
   const run = (t, o = {}) => {
     const pr = (o.b ? '<w:b/>' : '') + (o.color ? `<w:color w:val="${o.color}"/>` : '') + (o.sz ? `<w:sz w:val="${o.sz}"/><w:szCs w:val="${o.sz}"/>` : '');
@@ -340,6 +518,19 @@ function toDocx() {
         para(q.ask, { color: '5A5F86', sz: 19, after: 60 }) + table(rows);
     });
   });
+  // 작성 과정 기록: 본문보다 작은 회색 글씨
+  const st = logStats(endAt), lc = logCols(st);
+  const lw = st.hasPre ? [2100, 900, 900, 900, 900, 1000, 1400, 1400] : [2400, 1000, 1000, 1000, 1100, 1500, 1500];
+  const gc = (t, wd, head) => `<w:tc><w:tcPr><w:tcW w:w="${wd}" w:type="dxa"/></w:tcPr><w:p><w:pPr><w:spacing w:before="0" w:after="0"/></w:pPr>${run(String(t), { color: '8A8F99', sz: 15, b: head })}</w:p></w:tc>`;
+  const grow = (vals, head) => `<w:tr><w:trPr><w:cantSplit/></w:trPr>${vals.map((v, i) => gc(v, lw[i], head)).join('')}</w:tr>`;
+  body += para('작성 과정 기록', { b: true, sz: 17, color: '8A8F99', before: 480, after: 40 });
+  logLines(st).forEach(l => { body += para(l, { color: '8A8F99', sz: 16, after: 20 }); });
+  body += `<w:tbl><w:tblPr><w:tblW w:w="9500" w:type="dxa"/><w:tblBorders>` +
+    ['top', 'left', 'bottom', 'right', 'insideH', 'insideV'].map(b => `<w:${b} w:val="single" w:sz="4" w:color="E0E2E8"/>`).join('') +
+    `</w:tblBorders><w:tblCellMar><w:top w:w="30" w:type="dxa"/><w:left w:w="60" w:type="dxa"/><w:bottom w:w="30" w:type="dxa"/><w:right w:w="60" w:type="dxa"/></w:tblCellMar></w:tblPr>` +
+    `<w:tblGrid>${lw.map(w => `<w:gridCol w:w="${w}"/>`).join('')}</w:tblGrid>` + grow(lc, true) +
+    (st.rows.length ? st.rows.map(r => grow(logRow(st, r), false)).join('') : grow([ '기록된 입력이 없습니다.' ].concat(lc.slice(1).map(() => '')), false)) + '</w:tbl>';
+  body += para(LOG_NOTE, { color: '8A8F99', sz: 15, before: 60 });
   const doc = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>${body}` +
     `<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1134" w:right="1134" w:bottom="1134" w:left="1134" w:header="567" w:footer="567" w:gutter="0"/></w:sectPr></w:body></w:document>`;
   const styles = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:rPrDefault><w:rPr>` +
@@ -365,7 +556,8 @@ async function offer(ext) {
   const filename = `${fileBase()}.${ext}`;
   try {
     if (ext === 'docx' && typeof JSZip === 'undefined') throw { code: 'no_zip' };
-    await dl.save({ filename, data: ext === 'html' ? toHtml() : await toDocx() });
+    const endAt = recordDownload(ext);
+    await dl.save({ filename, data: ext === 'html' ? toHtml(endAt) : await toDocx(endAt) });
     status(`${filename} 저장을 요청했습니다. 다운로드 폴더를 확인하세요.`, 'good');
   } catch (e) {
     if (e && e.code === 'declined') status('저장을 취소했습니다. 다시 누르면 저장할 수 있어요.', 'warn');
@@ -384,6 +576,15 @@ document.getElementById('show-copy').addEventListener('click', () => {
 });
 
 render();
+initLog();
+// 같은 컴퓨터를 여러 학생이 쓸 때: 내용과 작성 과정 기록을 한 번에 지운다
+document.getElementById('reset-all').addEventListener('click', () => { document.getElementById('reset-confirm').hidden = false; });
+document.getElementById('reset-no').addEventListener('click', () => { document.getElementById('reset-confirm').hidden = true; });
+document.getElementById('reset-yes').addEventListener('click', () => {
+  resetting = true; clearTimeout(logTimer);
+  try { localStorage.removeItem(KEY); localStorage.removeItem(LOG_KEY); } catch (e) {}
+  location.reload();
+});
 // 일반 웹사이트용: 브라우저 다운로드로 저장한다
 dl = { save: async ({ filename, data }) => {
   const types = { html: 'text/html;charset=utf-8', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' };
